@@ -1,0 +1,3 @@
+graft tests
+include CHANGELOG.md CONTRIBUTING.md SECURITY.md Timelock.bat Timelock.command
+global-exclude *.py[cod] __pycache__
