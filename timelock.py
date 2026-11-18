@@ -1,52 +1,76 @@
 #!/usr/bin/env python3
 """
-timelock.py - lock secrets behind hours of unavoidable computation.
+timelock - lock secrets behind hours of unavoidable computation.
 
-Uses the Rivest-Shamir-Wagner time-lock puzzle: unlocking requires computing
-2^(2^t) mod n by t sequential squarings. Each squaring needs the previous
-result, so extra cores, GPUs, or AI can't speed it up. Creating the puzzle is
-instant because the creator knows the factors of n (then throws them away).
+Uses the Rivest-Shamir-Wagner (1996) time-lock puzzle: unlocking requires
+computing 2^(2^t) mod n with t sequential squarings. Each squaring needs the
+previous result, so extra cores or GPUs don't help. Creating the puzzle is
+instant because the creator knows the factors of n (and then throws them away).
 
-Easiest: run it with no arguments (or double-click Timelock.bat on Windows)
-to get a menu. No commands needed.
+Easiest: run it with no arguments (or double-click Timelock.bat on Windows,
+Timelock.command on macOS) to get a menu. No commands needed.
 
 Commands (optional, for power users):
-  python timelock.py genpass                     print a strong random password
-  python timelock.py create vault.tlp --hours 48 lock secrets into vault.tlp
-  python timelock.py solve vault.tlp             unlock (resumable, Ctrl+C safe)
-  python timelock.py status vault.tlp            show progress without solving
-  python timelock.py bench                       squarings/sec on this machine
+  timelock genpass                       print a strong random password
+  timelock create vault.tlp --hours 48   lock secrets into vault.tlp
+  timelock solve vault.tlp               unlock (resumable, Ctrl+C safe)
+  timelock status vault.tlp              show progress without solving
+  timelock bench                         squarings/sec on this machine
+`python timelock.py ...` and `python -m timelock ...` work the same way.
 
-Optional speedup: pip install gmpy2   (install it BEFORE `create` so the lock
-is calibrated to the fastest speed you could ever solve at.)
+Optional speedup: pip install gmpy2. Install it BEFORE `create`, so the lock is
+calibrated to the fastest speed this machine could ever solve it at.
 """
 
 import argparse
 import getpass
 import hashlib
 import hmac
+import importlib
 import json
+import math
 import os
 import secrets
 import signal
+import site
 import string
 import subprocess
 import sys
+import tempfile
 import time
+import traceback
 from types import SimpleNamespace
 
 try:
     import gmpy2
-    from gmpy2 import mpz
-    HAVE_GMPY2 = True
 except ImportError:
-    HAVE_GMPY2 = False
-    mpz = int
+    gmpy2 = None
 
-VERSION = 1
+__version__ = "1.0.0"
+
+HAVE_GMPY2 = gmpy2 is not None
+FORMAT_VERSION = 1             # vault format written by `create`
+READABLE_VERSIONS = (1,)       # vault formats `solve` and `status` understand
 MODULUS_BITS = 2048
-CHECKPOINT_SECONDS = 30
-CHUNK = 20_000
+CHECKPOINT_SECONDS = 10
+CHUNK = 20_000                 # squarings between checks for a pause request
+STOP_SIGNALS = ("SIGINT", "SIGTERM", "SIGBREAK", "SIGHUP")
+
+
+class TimelockError(Exception):
+    """A problem to show the user as a plain message, without a traceback."""
+
+
+class IntegrityError(TimelockError):
+    """The puzzle answer doesn't open the vault (wrong answer or altered file)."""
+
+
+class ProgressError(TimelockError):
+    """The .progress file is unreadable or inconsistent."""
+
+
+class ProgressMismatch(ProgressError):
+    """The .progress file belongs to a different vault."""
 
 
 # ---------------------------------------------------------------- primes
@@ -85,43 +109,386 @@ def is_probable_prime(n, rounds=40):
 
 
 def random_prime(bits):
-    if HAVE_GMPY2:
-        while True:
-            c = mpz(secrets.randbits(bits)) | (mpz(1) << (bits - 1)) | 1
-            if gmpy2.is_prime(c, 50):
-                return int(c)
+    """Random prime with its top two bits set, so a product of two has exactly 2*bits bits."""
+    top = 3 << (bits - 2)
     while True:
-        c = secrets.randbits(bits) | (1 << (bits - 1)) | 1
-        if is_probable_prime(c):
+        c = secrets.randbits(bits) | top | 1
+        if gmpy2.is_prime(c, 50) if HAVE_GMPY2 else is_probable_prime(c):
             return c
 
 
+# ---------------------------------------------------------------- squaring
+
+def to_num(x):
+    """The fastest integer type available: gmpy2's mpz if installed, else int."""
+    return gmpy2.mpz(x) if HAVE_GMPY2 else int(x)
+
+
+def square_chain(x, steps, n):
+    """Return x^(2^steps) mod n, i.e. `steps` sequential modular squarings."""
+    for _ in range(steps):
+        x = x * x % n
+    return x
+
+
+def benchmark(seconds=2.0, bits=MODULUS_BITS):
+    """Squarings per second on this machine, through the solver's own code path."""
+    n = to_num(secrets.randbits(bits) | (1 << (bits - 1)) | 1)  # any odd modulus this size is as fast
+    x = to_num(secrets.randbits(bits - 1))
+    done = 0
+    start = time.perf_counter()
+    while True:
+        x = square_chain(x, CHUNK, n)
+        done += CHUNK
+        elapsed = time.perf_counter() - start
+        if elapsed >= seconds:
+            return done / elapsed
+
+
+def calibrate(runs=3, seconds=2.0):
+    """Best of several runs: the lock should match the fastest this machine can
+    go, not a moment when something else was keeping it busy."""
+    return max(benchmark(seconds) for _ in range(runs))
+
+
 # ---------------------------------------------------------------- crypto
+#
+# Format v1:
+#   key        = SHA-256("timelock-key" || b as 256 big-endian bytes)
+#   ciphertext = payload XOR SHAKE-256("timelock-stream" || key || nonce)
+#   tag        = HMAC-SHA256(key, nonce || ciphertext)        (encrypt-then-MAC)
+# where b = 2^(2^t) mod n is the puzzle answer and payload is the JSON secrets.
 
-def keystream(key, nonce, length):
-    return hashlib.shake_256(b"timelock-stream" + key + nonce).digest(length)
+V1_KEY_BYTES = 256
 
 
-def derive_key(b):
-    nbytes = (MODULUS_BITS + 7) // 8
-    return hashlib.sha256(b"timelock-key" + int(b).to_bytes(nbytes, "big")).digest()
+def _xor(data, stream):
+    return bytes(a ^ b for a, b in zip(data, stream))
 
 
-def seal(key, plaintext):
+def _v1_key(b):
+    return hashlib.sha256(b"timelock-key" + int(b).to_bytes(V1_KEY_BYTES, "big")).digest()
+
+
+def _seal(vault, b, entries):
+    """Encrypt `entries` into `vault` (adds nonce, ciphertext, tag)."""
+    key = _v1_key(b)
     nonce = secrets.token_bytes(16)
-    ct = bytes(x ^ y for x, y in zip(plaintext, keystream(key, nonce, len(plaintext))))
-    tag = hmac.new(key, nonce + ct, hashlib.sha256).digest()
-    return nonce, ct, tag
+    payload = json.dumps({"entries": entries}).encode("utf-8")
+    ct = _xor(payload, hashlib.shake_256(b"timelock-stream" + key + nonce).digest(len(payload)))
+    vault.update(nonce=nonce.hex(), ciphertext=ct.hex(), tag=hmac.new(key, nonce + ct, hashlib.sha256).hexdigest())
 
 
-def unseal(key, nonce, ct, tag):
-    expected = hmac.new(key, nonce + ct, hashlib.sha256).digest()
-    if not hmac.compare_digest(expected, tag):
-        raise ValueError("integrity check failed (wrong result or corrupted file)")
-    return bytes(x ^ y for x, y in zip(ct, keystream(key, nonce, len(ct))))
+def decrypt_entries(vault, b):
+    """Open a vault with its puzzle answer b and return the list of secrets.
+    Raises IntegrityError if b is wrong or the file was altered."""
+    nonce, ct, tag = (bytes.fromhex(vault[k]) for k in ("nonce", "ciphertext", "tag"))
+    key = _v1_key(b)
+    if not hmac.compare_digest(hmac.new(key, nonce + ct, hashlib.sha256).digest(), tag):
+        raise IntegrityError("integrity check failed (wrong answer or altered file)")
+    payload = _xor(ct, hashlib.shake_256(b"timelock-stream" + key + nonce).digest(len(ct)))
+    return json.loads(payload.decode("utf-8"))["entries"]
 
 
-# ---------------------------------------------------------------- helpers
+# ---------------------------------------------------------------- files
+
+def _is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def vault_problem(vault):
+    """Describe what is wrong with a parsed vault, or return None if it looks fine."""
+    if not isinstance(vault, dict):
+        return "is not a vault file."
+    version = vault.get("version")
+    if version not in READABLE_VERSIONS:
+        if _is_int(version) and version > max(READABLE_VERSIONS):
+            return f"was made by a newer Timelock (vault format {version}). Update Timelock to open it."
+        return "is not a vault file (unknown format)."
+    try:
+        n = int(vault["n"], 16)
+        t, base = vault["t"], vault["base"]
+        ok = (n > 3 and n % 2 == 1
+              and _is_int(t) and t >= 1 and _is_int(base) and 1 < base < n
+              and len(bytes.fromhex(vault["nonce"])) == 16
+              and len(bytes.fromhex(vault["tag"])) == 32
+              and len(bytes.fromhex(vault["ciphertext"])) > 0
+              and isinstance(vault["labels"], list) and all(isinstance(s, str) for s in vault["labels"]))
+    except (KeyError, TypeError, ValueError, AttributeError):
+        ok = False
+    if not ok:
+        return "is damaged (missing or malformed fields). Use your backup copy."
+    return None
+
+
+def load_vault(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            vault = json.load(f)
+    except FileNotFoundError:
+        raise TimelockError(f"There is no vault file at {path}.") from None
+    except (OSError, ValueError) as e:
+        raise TimelockError(f"Can't read {path} as a vault ({e}). If it is damaged, use your backup copy.") from None
+    problem = vault_problem(vault)
+    if problem:
+        raise TimelockError(f"{path} {problem}")
+    return vault
+
+
+def save_json_atomic(path, data, attempts=8):
+    """Write JSON so that `path` always holds either the old or the new content.
+
+    The temp file has a unique name, so two processes can't mix their writes, and
+    the final rename is retried because Windows refuses it while another program
+    (antivirus, cloud sync, a second Timelock window) has the file open."""
+    folder = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        for attempt in range(attempts):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt == attempts - 1:
+                    raise
+                time.sleep(0.05 * 2 ** attempt)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def move_aside(path, tag):
+    """Rename `path` out of the way (never delete anything) and return the new name."""
+    root, ext = os.path.splitext(path)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    candidate, k = f"{root}.{tag}-{stamp}{ext}", 1
+    while os.path.exists(candidate):
+        k += 1
+        candidate = f"{root}.{tag}-{stamp}-{k}{ext}"
+    os.replace(path, candidate)
+    return candidate
+
+
+def progress_path(vault_path):
+    return str(vault_path) + ".progress"
+
+
+def _progress_check(n_hex, i, x_hex):
+    return hashlib.sha256(f"timelock-progress|{n_hex}|{i}|{x_hex}".encode()).hexdigest()
+
+
+def write_progress(pp, vault, i, x):
+    x_hex = hex(int(x))
+    save_json_atomic(pp, {"n": vault["n"], "i": i, "x": x_hex, "check": _progress_check(vault["n"], i, x_hex)})
+
+
+def read_progress(pp, vault):
+    """Return (i, x) from a progress file, or (0, None) if there is none.
+
+    Progress files from before the "check" field existed are still accepted."""
+    if not os.path.exists(pp):
+        return 0, None
+    damaged = ProgressError(f"The progress file {pp} is damaged. If you have a copy of it, put it back; "
+                            "otherwise rename or delete it and unlock again to start over from 0%.")
+    try:
+        with open(pp, encoding="utf-8") as f:
+            p = json.load(f)
+        n_hex, i, x_hex = p["n"], p["i"], p["x"]
+        n, x = int(vault["n"], 16), int(x_hex, 16)
+        same_vault = int(n_hex, 16) == n
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        raise damaged from None
+    if not same_vault:
+        raise ProgressMismatch(f"The progress file {pp} belongs to a different vault.")
+    if "check" in p and p["check"] != _progress_check(n_hex, i, x_hex):
+        raise damaged
+    if not (_is_int(i) and 0 <= i <= vault["t"] and 0 < x < n) or (i == 0 and x != vault["base"]):
+        raise damaged
+    return i, x
+
+
+def vault_state(path, vault):
+    """(squarings done, problem description or "") for display."""
+    try:
+        return read_progress(progress_path(path), vault)[0], ""
+    except ProgressMismatch:
+        return 0, "a progress file from a different vault will be ignored"
+    except ProgressError:
+        return 0, "the progress file is damaged"
+
+
+# ---------------------------------------------------------------- create / solve
+
+def create_vault(path, entries, hours, rate, note="", bits=None):
+    """Lock `entries` ([{"label": ..., "secret": ...}, ...]) into a new vault file at
+    `path`, so that opening it takes about `hours` at `rate` squarings per second.
+    Never overwrites an existing file. Returns the vault."""
+    bits = bits or MODULUS_BITS
+    if not (isinstance(hours, (int, float)) and math.isfinite(hours) and hours > 0):
+        raise TimelockError("The unlock time must be a positive number of hours.")
+    if not entries:
+        raise TimelockError("Nothing to lock.")
+    if os.path.exists(path):
+        raise TimelockError(f"{path} already exists, and Timelock never overwrites a vault.")
+    t = max(1, int(rate * hours * 3600))
+
+    p = random_prime(bits // 2)
+    q = random_prime(bits // 2)
+    while q == p:
+        q = random_prime(bits // 2)
+    n, phi = p * q, (p - 1) * (q - 1)
+    # Check the shortcut against plain squaring on a small case first: a wrong phi
+    # (e.g. a "prime" that wasn't) would make the vault impossible to open.
+    if pow(2, pow(2, 1000, phi), n) != square_chain(to_num(2), 1000, to_num(n)):
+        raise TimelockError("Internal self-check failed, so nothing was written. Please report this.")
+    # The shortcut only the creator has: reduce the exponent 2^t modulo phi(n).
+    b = pow(2, pow(2, t, phi), n)
+    del p, q, phi  # drops our references; Python can't actually wipe memory
+
+    vault = {
+        "version": FORMAT_VERSION,
+        "n": hex(n),
+        "t": t,
+        "base": 2,
+        "labels": [e["label"] for e in entries],
+        "note": note,
+        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "calibrated_rate": rate,
+        "calibrated_hours": hours,
+        "calibrated_with_gmpy2": HAVE_GMPY2,
+    }
+    _seal(vault, b, entries)
+    stale = progress_path(path)
+    if os.path.exists(stale):
+        move_aside(stale, "stale")
+    save_json_atomic(path, vault)
+    # Read it back from disk and open it before telling anyone it worked.
+    if decrypt_entries(load_vault(path), b) != entries:
+        raise TimelockError("The new vault didn't verify after saving. Don't rely on it; please report this.")
+    return vault
+
+
+UNLOCK_FAILED = (
+    "Unlock failed: the computed answer doesn't match this vault's integrity check, so the\n"
+    "progress file or the vault file was damaged or edited. Try, in order:\n"
+    "  1. Restore the vault file from a backup and unlock again (progress is reused).\n"
+    "  2. Rename '{pp}' and unlock again to start over from 0%."
+)
+
+
+def solve_vault(path, start_over=False):
+    """Run or resume the puzzle for the vault at `path`.
+
+    Returns the list of secrets, or None if paused (Ctrl+C, Ctrl+Break, closing
+    the terminal, SIGTERM). Progress is saved every CHECKPOINT_SECONDS and on
+    pause. With start_over, a damaged progress file is moved aside instead of
+    stopping with an error."""
+    vault = load_vault(path)
+    n, t = to_num(int(vault["n"], 16)), vault["t"]
+    rate = vault.get("calibrated_rate") or 0
+    pp = progress_path(path)
+    try:
+        i, x = read_progress(pp, vault)
+    except ProgressMismatch:
+        print(f"Moved aside a progress file that belongs to a different vault: {move_aside(pp, 'other')}")
+        i, x = 0, None
+    except ProgressError:
+        if not start_over:
+            raise
+        print(f"Kept the damaged progress file as {move_aside(pp, 'damaged')}")
+        i, x = 0, None
+
+    if x is None:
+        x = vault["base"]
+        if vault.get("note"):
+            print(f"\nNote from past you: {vault['note']}\n")
+        print(f"Unlocking: {', '.join(vault['labels'])}")
+        if rate:
+            print(f"Estimated: ~{fmt_duration(t / rate)} of computing at the calibrated speed.")
+        print("Press Ctrl+C to pause anytime; progress is saved.\n")
+    else:
+        print(f"Resuming from {100 * i / t:.2f}%")
+    if not HAVE_GMPY2 and vault.get("calibrated_with_gmpy2"):
+        print("(gmpy2 isn't installed here, so this will take several times longer than estimated.)")
+
+    stop = SimpleNamespace(requested=False)
+    restore = _install_stop_handlers(stop)
+    try:
+        i, x = _run(pp, vault, n, t, i, to_num(x), stop)
+    finally:
+        restore()
+    if i < t:
+        return None
+    try:
+        return decrypt_entries(vault, x)
+    except IntegrityError:
+        raise TimelockError(UNLOCK_FAILED.format(pp=pp)) from None
+
+
+def _run(pp, vault, n, t, i, x, stop):
+    last_save = start = time.monotonic()
+    start_i = i
+    while i < t:
+        steps = min(CHUNK, t - i)
+        # A pause request only sets a flag (see _install_stop_handlers), so x and i
+        # always advance together and every checkpoint is consistent.
+        x, i = square_chain(x, steps, n), i + steps
+        now = time.monotonic()
+        if stop.requested and i < t:
+            if _checkpoint(pp, vault, i, x):
+                print(f"\nPaused at {100 * i / t:.2f}%. Unlock again to resume.")
+            break
+        if now - last_save >= CHECKPOINT_SECONDS or i == t:
+            if _checkpoint(pp, vault, i, x):
+                last_save = now
+            speed = (i - start_i) / (now - start) if now > start else 0
+            eta = fmt_duration((t - i) / speed) if speed else "?"
+            print(f"\r{100 * i / t:6.2f}%   {i:,}/{t:,}   ETA {eta}        ", end="", flush=True)
+    if i == t:
+        print("\n")
+    return i, x
+
+
+def _checkpoint(pp, vault, i, x):
+    try:
+        write_progress(pp, vault, i, x)
+        return True
+    except OSError as e:
+        print(f"\n(Couldn't save progress: {e}. Will try again.)")
+        return False
+
+
+def _install_stop_handlers(stop):
+    """Make Ctrl+C, Ctrl+Break, closing the terminal (SIGHUP) and SIGTERM request a
+    pause instead of killing the process. Returns a function that undoes this."""
+    def request_stop(signum, frame):
+        stop.requested = True
+
+    previous = {}
+    for name in STOP_SIGNALS:
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            previous[sig] = signal.signal(sig, request_stop)
+        except (ValueError, OSError):  # not the main thread, or not supported here
+            pass
+
+    def restore():
+        for sig, handler in previous.items():
+            if handler is not None:
+                signal.signal(sig, handler)
+    return restore
+
+
+# ---------------------------------------------------------------- shared UI
 
 def fmt_duration(seconds):
     seconds = int(max(0, seconds))
@@ -137,44 +504,6 @@ def fmt_duration(seconds):
     return f"{s}s"
 
 
-def benchmark(seconds=5.0):
-    """Squarings per second on this machine, same loop the solver uses."""
-    p = random_prime(MODULUS_BITS // 2)
-    q = random_prime(MODULUS_BITS // 2)
-    n = mpz(p * q)
-    x = mpz(2)
-    count = 0
-    start = time.perf_counter()
-    while time.perf_counter() - start < seconds:
-        for _ in range(2000):
-            x = x * x % n
-        count += 2000
-    return count / (time.perf_counter() - start)
-
-
-def progress_path(vault_path):
-    return vault_path + ".progress"
-
-
-def load_vault(path):
-    with open(path, "r", encoding="utf-8") as f:
-        v = json.load(f)
-    if v.get("version") != VERSION:
-        sys.exit("Unsupported vault version.")
-    return v
-
-
-def save_json_atomic(path, data):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-
-
-# ---------------------------------------------------------------- commands
-
 def make_password(groups=4):
     alphabet = string.ascii_letters + string.digits
     while True:
@@ -183,28 +512,22 @@ def make_password(groups=4):
             return pw
 
 
-def cmd_genpass(args):
-    print(make_password(args.groups))
+GMPY2_WARNING = """\
+WARNING: the speed library gmpy2 is not installed.
+  The lock is calibrated to how fast this computer runs Timelock right now.
+  With gmpy2 the same computer is typically 5-10x faster (6.8x when we
+  measured it), so a vault made now for 48 hours could be opened in roughly
+  5-10 hours just by installing gmpy2. Install it first (menu option 6, or
+  `pip install gmpy2`)."""
 
 
-def cmd_bench(args):
-    print(f"gmpy2: {'yes' if HAVE_GMPY2 else 'NO (pip install gmpy2 for the fast path)'}")
-    print("Benchmarking for ~5 seconds...")
-    rate = benchmark()
-    print(f"{rate:,.0f} squarings/sec")
-    print(f"48h lock = {int(rate * 48 * 3600):,} squarings on this machine")
+def confirm_without_gmpy2():
+    print(GMPY2_WARNING)
+    return input("Create the vault anyway, without gmpy2? [y/N] ").strip().lower() == "y"
 
 
-def cmd_create(args):
-    if os.path.exists(args.vault) and not args.force:
-        sys.exit(f"{args.vault} already exists. Use --force to overwrite.")
-    if not HAVE_GMPY2:
-        print("WARNING: gmpy2 not installed. If you later solve WITH gmpy2, it will unlock")
-        print("         several times faster than intended. Run `pip install gmpy2` first,")
-        print("         or answer 'y' to continue anyway.")
-        if input("Continue without gmpy2? [y/N] ").strip().lower() != "y":
-            return
-
+def ask_secrets():
+    """Ask for labelled secrets (hidden input) and an optional note."""
     print("\nEnter the secrets to lock. Input is hidden.")
     print("Leave the label empty when you're done.\n")
     entries = []
@@ -213,149 +536,118 @@ def cmd_create(args):
         if not label:
             break
         value = getpass.getpass("  Secret (hidden): ")
-        confirm = getpass.getpass("  Repeat secret:   ")
-        if value != confirm:
-            print("  Didn't match, try that one again.")
-            continue
         if not value:
             print("  Empty secret skipped.")
             continue
+        if getpass.getpass("  Repeat secret:   ") != value:
+            print("  Didn't match, try that one again.")
+            continue
         entries.append({"label": label, "secret": value})
+    note = ""
+    if entries:
+        note = input("Optional note shown before unlocking (e.g. 'Are you sure?'): ").strip()
+    return entries, note
+
+
+def measure_speed():
+    print("\nMeasuring this computer's speed (~6 s). For an accurate lock, keep it")
+    print("plugged in and close heavy programs while this runs.")
+    rate = calibrate()
+    print(f"  {rate:,.0f} squarings/sec")
+    return rate
+
+
+def report_created(path, vault, rate):
+    t = vault["t"]
+    print(f"\nLocked {len(vault['labels'])} secret(s) into {path}")
+    print(f"t = {t:,} squarings: about {fmt_duration(t / rate)} of computing on this machine.")
+    print("A faster computer can open it sooner (see the README for rough numbers).")
+    print("The shortcut has been discarded. If you lose this file, you lose these secrets.")
+
+
+def show_secrets(path, entries):
+    for entry in entries:
+        print(f"{entry['label']}: {entry['secret']}")
+    print(f"\nThis vault is now spent: {progress_path(path)} holds the answer,")
+    print("so anyone with both files can read these secrets instantly.")
+    print("To lock things up again: change the password(s), create a NEW vault, then")
+    print("delete this vault and its .progress file.")
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_genpass(args):
+    print(make_password(args.groups))
+    return 0
+
+
+def cmd_bench(args):
+    print(f"gmpy2: {'yes' if HAVE_GMPY2 else 'NO (pip install gmpy2 for the fast path)'}")
+    print("Measuring for ~6 seconds...")
+    rate = calibrate()
+    print(f"{rate:,.0f} squarings/sec")
+    print(f"A 48-hour lock = {int(rate * 48 * 3600):,} squarings on this machine")
+    return 0
+
+
+def cmd_create(args):
+    path = args.vault
+    if os.path.exists(path) and not args.force:
+        raise TimelockError(f"{path} already exists. Pick another name, or add --force to keep the "
+                            "old vault as a backup copy and create a new one in its place.")
+    if not HAVE_GMPY2 and not confirm_without_gmpy2():
+        print("Cancelled. Nothing was created.")
+        return 1
+    entries, note = ask_secrets()
     if not entries:
-        sys.exit("Nothing to lock.")
-    note = input("Optional note shown before unlocking (e.g. 'Are you sure?'): ").strip()
-
-    print("\nBenchmarking this machine (~5s)...")
-    rate = benchmark()
-    t = max(1, int(rate * args.hours * 3600))
-    print(f"  {rate:,.0f} squarings/sec  ->  t = {t:,} squarings (~{fmt_duration(t / rate)} here)")
-
-    print(f"Generating {MODULUS_BITS}-bit modulus...")
-    p = random_prime(MODULUS_BITS // 2)
-    q = random_prime(MODULUS_BITS // 2)
-    while q == p:
-        q = random_prime(MODULUS_BITS // 2)
-    n = p * q
-    phi = (p - 1) * (q - 1)
-
-    # Shortcut that only the creator has: reduce the exponent mod phi(n).
-    e = pow(2, t, phi)
-    b = pow(2, e, n)
-    del p, q, phi, e
-
-    key = derive_key(b)
-    payload = json.dumps({"entries": entries}).encode("utf-8")
-    nonce, ct, tag = seal(key, payload)
-    assert json.loads(unseal(key, nonce, ct, tag))["entries"] == entries
-    del b, key, payload
-
-    vault = {
-        "version": VERSION,
-        "n": hex(n),
-        "t": t,
-        "base": 2,
-        "nonce": nonce.hex(),
-        "ciphertext": ct.hex(),
-        "tag": tag.hex(),
-        "labels": [x["label"] for x in entries],
-        "note": note,
-        "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "calibrated_rate": rate,
-        "calibrated_hours": args.hours,
-        "calibrated_with_gmpy2": HAVE_GMPY2,
-    }
-    save_json_atomic(args.vault, vault)
-    print(f"\nLocked {len(entries)} secret(s) into {args.vault}")
-    print(f"Estimated unlock time on this machine: {fmt_duration(t / rate)} of computing.")
-    print("The shortcut has been discarded. Back up this file (USB / cloud) now.")
+        raise TimelockError("Nothing to lock.")
+    rate = measure_speed()
+    if os.path.exists(path):  # --force: keep the old vault (and its progress) under a new name
+        backup = move_aside(path, "bak")
+        if os.path.exists(progress_path(path)):
+            os.replace(progress_path(path), progress_path(backup))
+        print(f"Kept the old vault as {backup}")
+    print(f"Generating a {MODULUS_BITS}-bit modulus...")
+    vault = create_vault(path, entries, args.hours, rate, note)
+    report_created(path, vault, rate)
+    print("Back it up now (e.g. USB drive + cloud).")
+    return 0
 
 
 def cmd_status(args):
-    v = load_vault(args.vault)
-    t = v["t"]
-    done = 0
-    pp = progress_path(args.vault)
-    if os.path.exists(pp):
-        with open(pp, "r", encoding="utf-8") as f:
-            done = json.load(f).get("i", 0)
-    rate = v["calibrated_rate"]
-    print(f"Vault:    {args.vault}  (created {v['created']})")
-    print(f"Contains: {', '.join(v['labels'])}")
-    print(f"Progress: {done:,} / {t:,}  ({100 * done / t:.2f}%)")
-    print(f"Left:     ~{fmt_duration((t - done) / rate)} at the calibrated speed")
+    vault = load_vault(args.vault)
+    t = vault["t"]
+    done, problem = vault_state(args.vault, vault)
+    rate = vault.get("calibrated_rate") or 0
+    print(f"Vault:    {args.vault}  (created {vault.get('created', '?')}, format v{vault['version']})")
+    print(f"Contains: {', '.join(vault['labels'])}")
+    print(f"Progress: {done:,} / {t:,}  ({100 * done / t:.2f}%)" + (f"  [{problem}]" if problem else ""))
+    if done >= t:
+        print("State:    UNLOCKED. The progress file holds the answer: anyone with both files")
+        print("          can read the secrets instantly.")
+    elif rate:
+        print(f"Left:     ~{fmt_duration((t - done) / rate)} at the calibrated speed")
+    return 0
 
 
 def cmd_solve(args):
-    v = load_vault(args.vault)
-    n = mpz(int(v["n"], 16))
-    t = v["t"]
-    pp = progress_path(args.vault)
-
-    x, i = mpz(v["base"]), 0
-    if os.path.exists(pp):
-        with open(pp, "r", encoding="utf-8") as f:
-            prog = json.load(f)
-        if prog.get("n") == v["n"]:
-            x, i = mpz(int(prog["x"], 16)), prog["i"]
-            print(f"Resuming from {100 * i / t:.2f}%")
-    else:
-        if v.get("note"):
-            print(f"\nNote from past you: {v['note']}\n")
-        print(f"Unlocking {', '.join(v['labels'])}")
-        print(f"Estimated: ~{fmt_duration(t / v['calibrated_rate'])} of computing. Ctrl+C to pause anytime.\n")
-
-    if not HAVE_GMPY2:
-        print("(gmpy2 not installed - this will be slower than calibrated if it was created with gmpy2)")
-
-    stop = {"flag": False}
-
-    def _stop(signum, frame):
-        stop["flag"] = True
-    for sig in ("SIGINT", "SIGTERM", "SIGBREAK", "SIGHUP"):
-        if hasattr(signal, sig):
-            signal.signal(getattr(signal, sig), _stop)
-
-    def checkpoint():
-        save_json_atomic(pp, {"n": v["n"], "i": i, "x": hex(int(x))})
-
-    last_save = time.monotonic()
-    rate_start_t, rate_start_i = time.monotonic(), i
-    while i < t:
-        steps = min(CHUNK, t - i)
-        y = x
-        for _ in range(steps):
-            y = y * y % n
-        x, i = y, i + steps          # signals only set a flag, so this pair stays consistent
-        now = time.monotonic()
-        if stop["flag"]:
-            checkpoint()
-            print(f"\nPaused at {100 * i / t:.2f}%. Run solve again to resume.")
-            return
-        if now - last_save >= CHECKPOINT_SECONDS or i == t:
-            checkpoint()
-            last_save = now
-            elapsed = now - rate_start_t
-            rate = (i - rate_start_i) / elapsed if elapsed > 0 else 0
-            eta = fmt_duration((t - i) / rate) if rate else "?"
-            print(f"\r{100 * i / t:6.2f}%   {i:,}/{t:,}   ETA {eta}        ", end="", flush=True)
-
-    print("\n")
-    key = derive_key(x)
-    try:
-        payload = unseal(key, bytes.fromhex(v["nonce"]), bytes.fromhex(v["ciphertext"]), bytes.fromhex(v["tag"]))
-    except ValueError:
-        sys.exit(f"Unlock failed: the progress file is damaged. Delete '{pp}' and run solve again "
-                 "(starts over from 0%). Your vault file itself is fine.")
-    for entry in json.loads(payload)["entries"]:
-        print(f"{entry['label']}: {entry['secret']}")
-    print("\nDone. This vault is now spent (the progress file holds the answer).")
-    print("To lock things up again: change the password(s), then create a NEW vault (menu option 2).")
+    entries = solve_vault(args.vault)
+    if entries is not None:
+        show_secrets(args.vault, entries)
+    return 0
 
 
 # ---------------------------------------------------------------- menu
 
-HERE = os.path.dirname(os.path.abspath(__file__))
 HOUR_PRESETS = [("24 hours", 24), ("48 hours (recommended)", 48), ("72 hours", 72), ("1 week", 168)]
+
+
+def vault_dir():
+    """Where the menu keeps vaults: next to timelock.py when it was downloaded as a
+    single file, or the current folder when Timelock was installed with pip."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    parts = set(here.replace("\\", "/").lower().split("/"))
+    return os.getcwd() if parts & {"site-packages", "dist-packages"} else here
 
 
 def _ansi():
@@ -373,6 +665,10 @@ def bold(text):
 
 def dim(text):
     return f"\033[2m{text}\033[0m"
+
+
+def yellow(text):
+    return f"\033[33m{text}\033[0m"
 
 
 def pause():
@@ -407,35 +703,59 @@ def copy_to_clipboard(text):
 
 
 def clear_clipboard():
-    copy_to_clipboard(" ")
+    return copy_to_clipboard(" ")
 
 
 def find_vaults():
     found = []
-    for folder in dict.fromkeys([HERE, os.getcwd()]):
-        for name in sorted(os.listdir(folder)):
-            if name.endswith(".tlp"):
-                found.append(os.path.join(folder, name))
+    for folder in dict.fromkeys([vault_dir(), os.getcwd()]):
+        try:
+            names = sorted(os.listdir(folder))
+        except OSError:
+            continue
+        found += [os.path.join(folder, name) for name in names if name.endswith(".tlp")]
     return found
+
+
+def describe_vault(path):
+    try:
+        vault = load_vault(path)
+    except TimelockError:
+        return f"{os.path.basename(path)}  {dim('(unreadable)')}"
+    done, _ = vault_state(path, vault)
+    t = vault["t"]
+    state = "unlocked" if done >= t else f"{100 * done / t:.0f}% done" if done else "locked"
+    return f"{os.path.basename(path)}  {dim('(' + ', '.join(vault['labels']) + ' - ' + state + ')')}"
 
 
 def pick_vault():
     vaults = find_vaults()
     if not vaults:
-        print(f"No vault files (.tlp) found in:\n  {HERE}")
+        print(f"No vault files (.tlp) found in:\n  {vault_dir()}")
         print("Put your vault file in the same folder as timelock.py.")
         return None
     if len(vaults) == 1:
         return vaults[0]
-    labels = []
-    for p in vaults:
-        try:
-            v = load_vault(p)
-            labels.append(f"{os.path.basename(p)}  {dim('(' + ', '.join(v['labels']) + ')')}")
-        except Exception:
-            labels.append(os.path.basename(p))
-    idx = ask_choice("Which vault?", labels)
+    idx = ask_choice("Which vault?", [describe_vault(p) for p in vaults])
     return None if idx is None else vaults[idx]
+
+
+def ask_vault_name(folder):
+    """Ask for a new vault file name that doesn't exist yet. Returns the name."""
+    while True:
+        raw = input(f"\nVault name {dim('[vault]')}: ").strip() or "vault"
+        name = raw if raw.lower().endswith(".tlp") else raw + ".tlp"
+        if os.path.basename(name) != name or name.startswith(".") or any(
+                c in '<>:"/\\|?*' or ord(c) < 32 for c in name):
+            print("  Use a plain name made of letters, numbers, spaces or dashes.")
+            continue
+        if not os.path.exists(os.path.join(folder, name)):
+            return name
+        stem, k = name[:-4], 2
+        while os.path.exists(os.path.join(folder, f"{stem}-{k}.tlp")):
+            k += 1
+        print(f"  There's already a vault called {name}, and Timelock never overwrites vaults.")
+        print(f"  Pick another name, for example {stem}-{k}.")
 
 
 def menu_password():
@@ -458,46 +778,44 @@ def menu_password():
 def menu_create():
     clear()
     print(bold("Create a vault\n"))
+    if not HAVE_GMPY2 and not confirm_without_gmpy2():
+        print("\nNothing was created.")
+        pause()
+        return
     print("How long should unlocking take on this computer?\n")
     idx = ask_choice("Pick a length:", [label for label, _ in HOUR_PRESETS] + ["Custom"])
     if idx is None:
         return
     if idx == len(HOUR_PRESETS):
-        raw = input("Hours: ").strip()
         try:
-            hours = float(raw)
-            assert hours > 0
-        except Exception:
+            hours = float(input("Hours: ").strip())
+        except ValueError:
+            hours = float("nan")
+        if not (math.isfinite(hours) and hours > 0):
             print("That's not a number of hours.")
             pause()
             return
     else:
         hours = HOUR_PRESETS[idx][1]
 
-    name = input(f"\nVault name {dim('[vault]')}: ").strip() or "vault"
-    if not name.endswith(".tlp"):
-        name += ".tlp"
-    path = os.path.join(HERE, name)
-    force = False
-    if os.path.exists(path):
-        if input(f"{name} already exists. Overwrite it? [y/N] ").strip().lower() != "y":
-            return
-        force = True
-
+    folder = vault_dir()
+    path = os.path.join(folder, ask_vault_name(folder))
     print(dim("\nTip: to paste a hidden secret, use Ctrl+V (Windows) or Cmd+V (Mac), then Enter."))
-    try:
-        cmd_create(SimpleNamespace(vault=path, hours=hours, force=force))
-    except SystemExit as e:
-        if e.code:
-            print(e.code)
+    print(dim("Nothing appears on screen while you type or paste. That's normal."))
+    entries, note = ask_secrets()
+    if not entries:
+        print("\nNothing to lock, so no vault was created.")
         pause()
         return
-    clear_clipboard()
-    print("\nClipboard cleared.")
-    if os.name == "nt":
-        print(bold("Also press Win+V and choose 'Clear all'") + " - Windows keeps clipboard history.")
+    rate = measure_speed()
+    print(f"Generating a {MODULUS_BITS}-bit modulus...")
+    vault = create_vault(path, entries, hours, rate, note)
+    report_created(path, vault, rate)
+    # Only now: if creating failed, the generated password must stay on the clipboard.
+    if clear_clipboard():
+        print("\nClipboard cleared.")
     print(f"\nYour vault: {path}")
-    print(bold("Back it up now") + " (USB drive + Google Drive). Lose it = lose those secrets.")
+    print(bold("Back it up now") + " (e.g. USB drive + cloud). Lose it = lose those secrets.")
     pause()
 
 
@@ -508,17 +826,16 @@ def menu_solve():
     if not path:
         pause()
         return
-    old = {sig: signal.getsignal(getattr(signal, sig))
-           for sig in ("SIGINT", "SIGTERM", "SIGBREAK", "SIGHUP") if hasattr(signal, sig)}
-    print(dim("Press Ctrl+C anytime to pause. Progress is saved.\n"))
     try:
-        cmd_solve(SimpleNamespace(vault=path))
-    except SystemExit as e:
-        if e.code:
-            print(e.code)
-    finally:
-        for sig, handler in old.items():
-            signal.signal(getattr(signal, sig), handler)
+        entries = solve_vault(path)
+    except ProgressError as e:
+        print(e)
+        if input("\nStart over from 0%? The damaged file is kept, not deleted. [y/N] ").strip().lower() != "y":
+            pause()
+            return
+        entries = solve_vault(path, start_over=True)
+    if entries is not None:
+        show_secrets(path, entries)
     pause()
 
 
@@ -535,24 +852,58 @@ def menu_bench():
     clear()
     print(bold("Test this computer's speed\n"))
     cmd_bench(None)
-    print(dim("\nRun this on each computer. Create your vault on the fastest one."))
+    print(dim("\nRun this on each computer you own. Create your vault on the fastest one."))
     pause()
+
+
+def _activate_gmpy2():
+    """Start using gmpy2 right after installing it, without restarting."""
+    global gmpy2, HAVE_GMPY2
+    importlib.invalidate_caches()
+    try:
+        site.addsitedir(site.getusersitepackages())  # may not have existed at startup
+    except Exception:
+        pass
+    try:
+        gmpy2 = importlib.import_module("gmpy2")
+    except ImportError:
+        return False
+    HAVE_GMPY2 = True
+    return True
 
 
 def menu_install_gmpy2():
     clear()
     print(bold("Install the speed library (gmpy2)\n"))
-    print("Installing... this takes a minute.\n")
-    cmd = [sys.executable, "-m", "pip", "install", "--user", "gmpy2"]
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        result = subprocess.run([sys.executable, "-m", "pip", "install", "gmpy2"])
-    if result.returncode == 0:
-        print("\nInstalled. Restarting the app...")
-        time.sleep(1)
-        os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
-    print("\nInstall failed. Try running this in a terminal:  pip install gmpy2")
+    print("Installing from PyPI... this can take a minute.\n")
+    command = [sys.executable, "-m", "pip", "install", "gmpy2"]
+    in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    ok = (not in_venv and subprocess.run(command + ["--user"]).returncode == 0) \
+        or subprocess.run(command).returncode == 0
+    if ok and _activate_gmpy2():
+        print("\nInstalled and ready.")
+    elif ok:
+        print("\nInstalled. Close this window and open Timelock again to use it.")
+    else:
+        print("\nInstall failed. In a terminal, run:  python3 -m pip install --user gmpy2")
     pause()
+
+
+def run_menu_action(action):
+    try:
+        action()
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        time.sleep(0.8)
+    except EOFError:
+        raise
+    except TimelockError as e:
+        print(f"\n{e}")
+        pause()
+    except Exception:
+        traceback.print_exc()
+        print("\nSomething went wrong (details above). Please report it: see the README.")
+        pause()
 
 
 def menu():
@@ -561,7 +912,7 @@ def menu():
         clear()
         print(bold("=== Timelock Vault ===") + "   lock passwords behind hours of computing\n")
         if not HAVE_GMPY2:
-            print("\033[33m! Speed library not installed. Install it (option 6) BEFORE creating a vault.\033[0m\n")
+            print(yellow("! Speed library not installed. Install it (option 6) BEFORE creating a vault.") + "\n")
         vaults = find_vaults()
         if vaults:
             print(dim("Vaults here: " + ", ".join(os.path.basename(v) for v in vaults)) + "\n")
@@ -582,25 +933,35 @@ def menu():
             clear()
             return
         if raw.isdigit() and 1 <= int(raw) <= len(options):
-            try:
-                options[int(raw) - 1][1]()
-            except KeyboardInterrupt:
-                print("\nCancelled.")
-                time.sleep(0.8)
+            run_menu_action(options[int(raw) - 1][1])
 
 
-def main():
-    if len(sys.argv) == 1:
-        try:
-            menu()
-        except (KeyboardInterrupt, EOFError):
-            print()
-        return
-    ap = argparse.ArgumentParser(description="Time-lock puzzle vault.")
+# ---------------------------------------------------------------- main
+
+def positive_hours(text):
+    try:
+        hours = float(text)
+    except ValueError:
+        hours = float("nan")
+    if not (math.isfinite(hours) and hours > 0):
+        raise argparse.ArgumentTypeError(f"{text!r} is not a positive number of hours")
+    return hours
+
+
+def positive_int(text):
+    if not text.isdigit() or int(text) < 1:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a positive whole number")
+    return int(text)
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog="timelock",
+                                 description="Time-lock puzzle vault. Run with no arguments for a menu.")
+    ap.add_argument("--version", action="version", version=f"timelock {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     g = sub.add_parser("genpass", help="print a strong random password")
-    g.add_argument("--groups", type=int, default=4, help="5-char groups (default 4)")
+    g.add_argument("--groups", type=positive_int, default=4, help="5-character groups (default 4)")
     g.set_defaults(func=cmd_genpass)
 
     b = sub.add_parser("bench", help="measure squarings/sec")
@@ -608,8 +969,9 @@ def main():
 
     c = sub.add_parser("create", help="lock secrets into a vault file")
     c.add_argument("vault")
-    c.add_argument("--hours", type=float, required=True, help="unlock time on this machine")
-    c.add_argument("--force", action="store_true")
+    c.add_argument("--hours", type=positive_hours, required=True, help="unlock time on this machine")
+    c.add_argument("--force", action="store_true",
+                   help="if the vault exists, keep it as a .bak-<date>.tlp copy and create a new one")
     c.set_defaults(func=cmd_create)
 
     s = sub.add_parser("solve", help="unlock a vault (resumable)")
@@ -619,10 +981,32 @@ def main():
     st = sub.add_parser("status", help="show unlock progress")
     st.add_argument("vault")
     st.set_defaults(func=cmd_status)
+    return ap
 
-    args = ap.parse_args()
-    args.func(args)
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    for stream in (sys.stdout, sys.stderr):
+        try:  # never crash at the very end of a long solve over an unprintable character
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
+    if not argv:
+        try:
+            menu()
+        except (KeyboardInterrupt, EOFError):
+            print()
+        return 0
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except TimelockError as e:
+        print(f"timelock: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print()
+        return 130
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

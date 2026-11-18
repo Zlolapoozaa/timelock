@@ -1,3 +1,14 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = [".", "tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+extend-exclude = ["tests/legacy/timelock_v1.py"]  # frozen verbatim copy of the original
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["timelock", "helpers", "legacy"]
