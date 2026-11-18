@@ -52,13 +52,33 @@ def test_single_secret_and_tiny_t(backend, tmp_path):
     assert tl.solve_vault(str(tmp_path / "v.tlp")) == entries
 
 
-def test_backends_compute_the_same_squarings():
-    pytest.importorskip("gmpy2")
-    import gmpy2
+def test_backends_compute_the_same_squarings(monkeypatch):
+    gmpy2 = pytest.importorskip("gmpy2")
     n = (1 << 511) + 187  # any odd modulus
+    x = 3
+    for _ in range(5000):  # the definition: one squaring at a time
+        x = x * x % n
+    monkeypatch.setattr(tl, "HAVE_GMPY2", False)
     pure = tl.square_chain(3, 5000, n)
+    monkeypatch.setattr(tl, "HAVE_GMPY2", True)
+    monkeypatch.setattr(tl, "gmpy2", gmpy2)
     fast = tl.square_chain(gmpy2.mpz(3), 5000, gmpy2.mpz(n))
-    assert pure == fast == pow(3, 1 << 5000, n)
+    assert type(pure) is int and type(fast) is type(gmpy2.mpz(1))
+    assert pure == fast == x
+
+
+def test_calibration_takes_the_best_run(monkeypatch):
+    runs = iter([100.0, 300.0, 200.0])
+    monkeypatch.setattr(tl, "benchmark", lambda seconds: next(runs))
+    assert tl.calibrate(runs=3, seconds=0) == 300.0
+
+
+def test_benchmark_measures_the_solver_path(backend, monkeypatch):
+    calls = []
+    real = tl.square_chain
+    monkeypatch.setattr(tl, "square_chain", lambda x, s, n: calls.append(s) or real(x, s, n))
+    assert tl.benchmark(seconds=0.05, bits=512) > 0
+    assert calls and all(s == tl.CHUNK for s in calls)
 
 
 def test_rerunning_a_finished_vault_is_instant(backend, tmp_path, monkeypatch):

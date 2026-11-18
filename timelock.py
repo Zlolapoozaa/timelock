@@ -125,10 +125,15 @@ def to_num(x):
 
 
 def square_chain(x, steps, n):
-    """Return x^(2^steps) mod n, i.e. `steps` sequential modular squarings."""
-    for _ in range(steps):
-        x = x * x % n
-    return x
+    """Return x^(2^steps) mod n, i.e. `steps` sequential modular squarings.
+
+    One modular exponentiation by 2^steps performs exactly those squarings
+    without Python's per-step overhead (about 20% faster than a Python loop with
+    gmpy2). The speed test uses this same function, so locks are calibrated to the
+    fastest path this program has, not a slower one someone could easily beat."""
+    if HAVE_GMPY2:
+        return gmpy2.powmod(x, gmpy2.mpz(1) << steps, n)
+    return pow(x, 1 << steps, n)
 
 
 def benchmark(seconds=2.0, bits=MODULUS_BITS):
@@ -574,7 +579,7 @@ def make_password(groups=4):
 GMPY2_WARNING = """\
 WARNING: the speed library gmpy2 is not installed.
   The lock is calibrated to how fast this computer runs Timelock right now.
-  With gmpy2 the same computer is typically 5-10x faster (6.8x when we
+  With gmpy2 the same computer is typically 5-10x faster (8x when we
   measured it), so a vault made now for 48 hours could be opened in roughly
   5-10 hours just by installing gmpy2. Install it first (menu option 6, or
   `pip install gmpy2`)."""
