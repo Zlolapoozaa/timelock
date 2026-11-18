@@ -49,8 +49,8 @@ except ImportError:
 __version__ = "1.0.0"
 
 HAVE_GMPY2 = gmpy2 is not None
-FORMAT_VERSION = 1             # vault format written by `create`
-READABLE_VERSIONS = (1,)       # vault formats `solve` and `status` understand
+FORMAT_VERSION = 2             # vault format written by `create`
+READABLE_VERSIONS = (1, 2)     # vault formats `solve` and `status` understand
 MODULUS_BITS = 2048
 CHECKPOINT_SECONDS = 10
 CHUNK = 20_000                 # squarings between checks for a pause request
@@ -153,40 +153,96 @@ def calibrate(runs=3, seconds=2.0):
 
 # ---------------------------------------------------------------- crypto
 #
-# Format v1:
-#   key        = SHA-256("timelock-key" || b as 256 big-endian bytes)
-#   ciphertext = payload XOR SHAKE-256("timelock-stream" || key || nonce)
-#   tag        = HMAC-SHA256(key, nonce || ciphertext)        (encrypt-then-MAC)
-# where b = 2^(2^t) mod n is the puzzle answer and payload is the JSON secrets.
+# b = 2^(2^t) mod n is the puzzle answer; the payload is the secrets as JSON.
+#
+# Format v2 (written by create since 1.0.0), standard library only:
+#   enc_key, mac_key = HKDF-SHA256(b, salt="timelock-v2", info="encryption" / "authentication")
+#   payload     = JSON padded with spaces to a multiple of 128 bytes (hides secret lengths)
+#   ciphertext  = payload XOR SHAKE-256("timelock-v2-stream" || enc_key || nonce)
+#   tag         = HMAC-SHA256(mac_key, "timelock-v2-mac" || len(header) || header || ciphertext)
+#                 where header = canonical JSON of version, n, t, base, nonce, labels, note
+#   checksum    = SHA-256 of the file's canonical JSON. Not a security feature: it catches
+#                 accidental damage before a long solve instead of after it.
+#
+# Format v1 (still read, no longer written):
+#   key         = SHA-256("timelock-key" || b as 256 big-endian bytes)
+#   ciphertext  = payload XOR SHAKE-256("timelock-stream" || key || nonce)
+#   tag         = HMAC-SHA256(key, nonce || ciphertext)
+#
+# Both are encrypt-then-MAC: the tag is checked, in constant time, before decrypting.
 
 V1_KEY_BYTES = 256
+PAD_TO = 128
+V2_HEADER = ("version", "n", "t", "base", "nonce", "labels", "note")
 
 
 def _xor(data, stream):
     return bytes(a ^ b for a, b in zip(data, stream))
 
 
+def _canonical(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+
+
+def hkdf_sha256(ikm, salt, info, length=32):
+    """HKDF (RFC 5869) with SHA-256."""
+    prk = hmac.new(salt, ikm, hashlib.sha256).digest()
+    okm, block, counter = b"", b"", 1
+    while len(okm) < length:
+        block = hmac.new(prk, block + info + bytes([counter]), hashlib.sha256).digest()
+        okm += block
+        counter += 1
+    return okm[:length]
+
+
+def checksum(vault):
+    """SHA-256 over everything in the vault except the checksum itself."""
+    return hashlib.sha256(_canonical({k: v for k, v in vault.items() if k != "checksum"})).hexdigest()
+
+
 def _v1_key(b):
     return hashlib.sha256(b"timelock-key" + int(b).to_bytes(V1_KEY_BYTES, "big")).digest()
 
 
+def _v2_keys(b, vault):
+    n = int(vault["n"], 16)
+    ikm = int(b).to_bytes((n.bit_length() + 7) // 8, "big")
+    return (hkdf_sha256(ikm, b"timelock-v2", b"encryption"),
+            hkdf_sha256(ikm, b"timelock-v2", b"authentication"))
+
+
+def _v2_tag(mac_key, vault, ct):
+    header = _canonical({k: vault[k] for k in V2_HEADER})
+    message = b"timelock-v2-mac" + len(header).to_bytes(8, "big") + header + ct
+    return hmac.new(mac_key, message, hashlib.sha256).digest()
+
+
 def _seal(vault, b, entries):
-    """Encrypt `entries` into `vault` (adds nonce, ciphertext, tag)."""
-    key = _v1_key(b)
-    nonce = secrets.token_bytes(16)
+    """Encrypt `entries` into a v2 `vault` (adds nonce, ciphertext, tag, checksum)."""
+    enc_key, mac_key = _v2_keys(b, vault)
     payload = json.dumps({"entries": entries}).encode("utf-8")
-    ct = _xor(payload, hashlib.shake_256(b"timelock-stream" + key + nonce).digest(len(payload)))
-    vault.update(nonce=nonce.hex(), ciphertext=ct.hex(), tag=hmac.new(key, nonce + ct, hashlib.sha256).hexdigest())
+    payload += b" " * (-len(payload) % PAD_TO)
+    nonce = secrets.token_bytes(16)
+    ct = _xor(payload, hashlib.shake_256(b"timelock-v2-stream" + enc_key + nonce).digest(len(payload)))
+    vault["nonce"] = nonce.hex()
+    vault["ciphertext"] = ct.hex()
+    vault["tag"] = _v2_tag(mac_key, vault, ct).hex()
+    vault["checksum"] = checksum(vault)
 
 
 def decrypt_entries(vault, b):
     """Open a vault with its puzzle answer b and return the list of secrets.
     Raises IntegrityError if b is wrong or the file was altered."""
     nonce, ct, tag = (bytes.fromhex(vault[k]) for k in ("nonce", "ciphertext", "tag"))
-    key = _v1_key(b)
-    if not hmac.compare_digest(hmac.new(key, nonce + ct, hashlib.sha256).digest(), tag):
+    if vault["version"] == 1:
+        key = _v1_key(b)
+        expected, seed = hmac.new(key, nonce + ct, hashlib.sha256).digest(), b"timelock-stream" + key + nonce
+    else:
+        enc_key, mac_key = _v2_keys(b, vault)
+        expected, seed = _v2_tag(mac_key, vault, ct), b"timelock-v2-stream" + enc_key + nonce
+    if not hmac.compare_digest(expected, tag):
         raise IntegrityError("integrity check failed (wrong answer or altered file)")
-    payload = _xor(ct, hashlib.shake_256(b"timelock-stream" + key + nonce).digest(len(ct)))
+    payload = _xor(ct, hashlib.shake_256(seed).digest(len(ct)))
     return json.loads(payload.decode("utf-8"))["entries"]
 
 
@@ -201,7 +257,7 @@ def vault_problem(vault):
     if not isinstance(vault, dict):
         return "is not a vault file."
     version = vault.get("version")
-    if version not in READABLE_VERSIONS:
+    if not _is_int(version) or version not in READABLE_VERSIONS:
         if _is_int(version) and version > max(READABLE_VERSIONS):
             return f"was made by a newer Timelock (vault format {version}). Update Timelock to open it."
         return "is not a vault file (unknown format)."
@@ -213,11 +269,14 @@ def vault_problem(vault):
               and len(bytes.fromhex(vault["nonce"])) == 16
               and len(bytes.fromhex(vault["tag"])) == 32
               and len(bytes.fromhex(vault["ciphertext"])) > 0
-              and isinstance(vault["labels"], list) and all(isinstance(s, str) for s in vault["labels"]))
+              and isinstance(vault["labels"], list) and all(isinstance(s, str) for s in vault["labels"])
+              and (version == 1 or isinstance(vault["note"], str)))
     except (KeyError, TypeError, ValueError, AttributeError):
         ok = False
     if not ok:
         return "is damaged (missing or malformed fields). Use your backup copy."
+    if version >= 2 and vault.get("checksum") != checksum(vault):
+        return "is damaged (its checksum doesn't match, so it was changed or corrupted). Use your backup copy."
     return None
 
 
