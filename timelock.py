@@ -754,20 +754,101 @@ def ask_choice(prompt, options):
 
 
 def copy_to_clipboard(text):
-    try:
-        if os.name == "nt":
-            subprocess.run("clip", input=text.encode("utf-16le"), check=True, shell=True)
-        elif sys.platform == "darwin":
-            subprocess.run(["pbcopy"], input=text.encode(), check=True)
-        else:
-            subprocess.run(["xclip", "-selection", "clipboard"], input=text.encode(), check=True)
-        return True
-    except Exception:
-        return False
+    """Put `text` on the clipboard ("" empties it). Returns True on success.
+
+    On Windows the text is marked so clipboard history (Win+V) and cloud clipboard
+    sync skip it. macOS and Linux have no standard way to ask that, so clipboard
+    managers or Universal Clipboard may still see it (see the README)."""
+    if os.name == "nt":
+        try:
+            _windows_set_clipboard(text)
+            return True
+        except OSError:
+            return False
+    return _copy_with_commands(text, _clipboard_commands(sys.platform, os.environ))
 
 
 def clear_clipboard():
-    return copy_to_clipboard(" ")
+    return copy_to_clipboard("")
+
+
+def _clipboard_commands(platform, environ):
+    """Clipboard programs to try, in order, on macOS and Linux."""
+    if platform == "darwin":
+        return [["pbcopy"]]
+    wayland = [["wl-copy"]] if environ.get("WAYLAND_DISPLAY") else []
+    return wayland + [["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]
+
+
+def _copy_with_commands(text, commands):
+    for command in commands:
+        try:  # xclip/xsel/wl-copy stay in the background to serve the clipboard: don't wait on their output
+            subprocess.run(command, input=text.encode("utf-8"), check=True, timeout=5,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return False
+
+
+def _windows_set_clipboard(text):
+    """Set (or with "" empty) the Windows clipboard via the Win32 API, marked so that
+    clipboard history and cloud clipboard ignore it. Raises OSError on failure."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+                                       ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                       wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+    user32.CreateWindowExW.restype = wintypes.HWND
+    user32.DestroyWindow.argtypes = [wintypes.HWND]
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    user32.SetClipboardData.restype = wintypes.HANDLE
+    user32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+    user32.RegisterClipboardFormatW.restype = wintypes.UINT
+    kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+
+    def check(result):
+        if not result:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return result
+
+    def put(fmt, data):
+        handle = check(kernel32.GlobalAlloc(0x0002, len(data)))  # GMEM_MOVEABLE
+        ctypes.memmove(check(kernel32.GlobalLock(handle)), data, len(data))
+        kernel32.GlobalUnlock(handle)
+        if not user32.SetClipboardData(fmt, handle):  # on success Windows owns the memory
+            kernel32.GlobalFree(handle)
+            check(0)
+
+    # Windows wants a window to own the clipboard; a hidden one is enough.
+    hwnd = check(user32.CreateWindowExW(0, "STATIC", None, 0, 0, 0, 0, 0, None, None, None, None))
+    try:
+        for _ in range(50):  # another program may have the clipboard open for a moment
+            if user32.OpenClipboard(hwnd):
+                break
+            time.sleep(0.02)
+        else:
+            check(0)
+        try:
+            check(user32.EmptyClipboard())
+            if text:
+                put(13, (text + "\0").encode("utf-16-le"))  # CF_UNICODETEXT
+                for name in ("ExcludeClipboardContentFromMonitorProcessing",
+                             "CanIncludeInClipboardHistory", "CanUploadToCloudClipboard"):
+                    put(check(user32.RegisterClipboardFormatW(name)), b"\0\0\0\0")  # DWORD 0 = "no"
+        finally:
+            user32.CloseClipboard()
+    finally:
+        user32.DestroyWindow(hwnd)
 
 
 def find_vaults():
