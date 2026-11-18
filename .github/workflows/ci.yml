@@ -38,7 +38,11 @@ jobs:
           # Python 3.9 on macOS is covered by the built-in /usr/bin/python3 job below.
           - os: macos-latest
             python: "3.9"
+          # ubuntu-latest (26.04) has no Python 3.9 build; it runs on 24.04 instead.
+          - os: ubuntu-latest
+            python: "3.9"
         include:
+          - { os: ubuntu-24.04, python: "3.9", gmpy2: "yes" }
           # The pure-Python path is also tested in every job (in-process); these
           # make sure Timelock imports and runs with gmpy2 genuinely absent.
           - { os: ubuntu-latest, python: "3.13", gmpy2: "no" }
