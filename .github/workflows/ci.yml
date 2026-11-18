@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install ruff
+      - run: ruff check .
+
+  test:
+    name: test (${{ matrix.os }}, Python ${{ matrix.python }}${{ matrix.gmpy2 == 'no' && ', no gmpy2' || '' }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
+        gmpy2: ["yes"]
+        exclude:
+          # Python 3.9 on macOS is covered by the built-in /usr/bin/python3 job below.
+          - os: macos-latest
+            python: "3.9"
+        include:
+          # The pure-Python path is also tested in every job (in-process); these
+          # make sure Timelock imports and runs with gmpy2 genuinely absent.
+          - { os: ubuntu-latest, python: "3.13", gmpy2: "no" }
+          - { os: windows-latest, python: "3.13", gmpy2: "no" }
+          - { os: macos-latest, python: "3.13", gmpy2: "no" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
+      - run: python -m pip install pytest
+      - name: Install gmpy2 (optional speedup)
+        if: matrix.gmpy2 == 'yes'
+        shell: bash
+        run: python -m pip install gmpy2 || echo "::warning::gmpy2 is not installable here; its tests will be skipped"
+      - run: python -m pytest -rs
+
+  macos-system-python:
+    # Double-clicking Timelock.command on a Mac often runs Apple's own python3 (3.9).
+    name: test (macOS built-in /usr/bin/python3)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: /usr/bin/python3 --version
+      - run: /usr/bin/python3 -m pip install --user pytest
+      - run: /usr/bin/python3 -m pytest -rs
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install build
+      - run: python -m build
+      - name: Install the wheel and run the commands
+        run: |
+          python -m pip install dist/*.whl
+          timelock --version
+          python -m timelock --version
+          timelock genpass
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

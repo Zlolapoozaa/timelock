@@ -1,5 +1,7 @@
 # Timelock
 
+[![CI](https://github.com/Zlolapoozaa/timelock/actions/workflows/ci.yml/badge.svg)](https://github.com/Zlolapoozaa/timelock/actions/workflows/ci.yml)
+
 Lock a secret behind hours of computing that can't be skipped, so you can always
 get it back, just not on impulse.
 
