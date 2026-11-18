@@ -37,6 +37,7 @@ import string
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from types import SimpleNamespace
@@ -482,11 +483,14 @@ def solve_vault(path, start_over=False):
     if not HAVE_GMPY2 and vault.get("calibrated_with_gmpy2"):
         print("(gmpy2 isn't installed here, so this will take several times longer than estimated.)")
 
-    stop = SimpleNamespace(requested=False)
+    stop = SimpleNamespace(requested=False, saved=threading.Event())
     restore = _install_stop_handlers(stop)
+    release = _hold_console_close(stop)
     try:
         i, x = _run(pp, vault, n, t, i, to_num(x), stop)
     finally:
+        stop.saved.set()
+        release()
         restore()
     if i < t:
         return None
@@ -506,7 +510,9 @@ def _run(pp, vault, n, t, i, x, stop):
         x, i = square_chain(x, steps, n), i + steps
         now = time.monotonic()
         if stop.requested and i < t:
-            if _checkpoint(pp, vault, i, x):
+            saved = _checkpoint(pp, vault, i, x)
+            stop.saved.set()  # a closing console window may be waiting for this
+            if saved:
                 print(f"\nPaused at {100 * i / t:.2f}%. Unlock again to resume.")
             break
         if now - last_save >= CHECKPOINT_SECONDS or i == t:
@@ -550,6 +556,34 @@ def _install_stop_handlers(stop):
             if handler is not None:
                 signal.signal(sig, handler)
     return restore
+
+
+def _hold_console_close(stop):
+    """Windows only. Closing the console window (or logging off) ends the process as
+    soon as its console handlers return, before Python ever acts on the SIGBREAK it
+    is sent, so the last checkpoint would be all that's kept. This handler requests
+    a pause and holds the close until the solve loop has saved (Windows allows about
+    5 seconds). Returns a function that removes it."""
+    if os.name != "nt":
+        return lambda: None
+    import ctypes
+    from ctypes import wintypes
+
+    close_events = (2, 5, 6)  # CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT
+    handler_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.SetConsoleCtrlHandler.argtypes = [handler_type, wintypes.BOOL]
+
+    @handler_type
+    def on_console_event(event):  # runs on a thread Windows creates
+        if event in close_events:
+            stop.requested = True
+            stop.saved.wait(4.0)
+        return False  # then let Python's own handler run as usual (Ctrl+C, Ctrl+Break)
+
+    if not kernel32.SetConsoleCtrlHandler(on_console_event, True):
+        return lambda: None
+    return lambda: kernel32.SetConsoleCtrlHandler(on_console_event, False)  # also keeps the callback alive
 
 
 # ---------------------------------------------------------------- shared UI
